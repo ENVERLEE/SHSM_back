@@ -23,7 +23,7 @@ from pdf2image import convert_from_bytes
 import pytesseract
 from PIL import Image
 import trafilatura
-
+import re
 # Load environment variables
 load_dotenv()
 
