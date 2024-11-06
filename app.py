@@ -82,6 +82,8 @@ def serialize_objectid(obj):
                 serialize_objectid(item)
     return obj
 
+# app.py의 AIService 클래스에 추가
+
 class AIService:
     def __init__(self):
         self.groq_api_key = os.getenv('GROQ_API_KEY')
@@ -89,7 +91,121 @@ class AIService:
         self.search_engine_id = os.getenv('GOOGLE_SEARCH_ENGINE_ID')
         self.google_api_key = os.getenv('GOOGLE_API_KEY')
 
+    def parse_research_plan(self, text):
+        """AI 응답을 파싱하여 JSON 형식으로 변환"""
+        try:
+            # 먼저 직접 JSON 파싱 시도
+            try:
+                data = json.loads(text)
+                if isinstance(data, list):
+                    return data
+                elif isinstance(data, dict):
+                    return [data]
+            except json.JSONDecodeError:
+                pass
+
+            # 텍스트를 단계별로 분리
+            steps = []
+            step_pattern = r'단계\s*\d+'
+            step_texts = re.split(step_pattern, text)
+            
+            for step_text in step_texts[1:]:  # 첫 번째는 건너뛰기
+                if not step_text.strip():
+                    continue
+
+                step_data = {
+                    'description': '',
+                    'keywords': '',
+                    'methodology': '',
+                    'output_format': ''
+                }
+
+                # 설명 추출
+                desc_patterns = [
+                    r'설명\s*:\s*([^키워드:방법:결과물:]+)',
+                    r'목표\s*:\s*([^키워드:방법:결과물:]+)'
+                ]
+                for pattern in desc_patterns:
+                    match = re.search(pattern, step_text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+                    if match:
+                        step_data['description'] = self.clean_text(match.group(1))
+                        break
+
+                # 키워드 추출
+                keyword_match = re.search(r'키워드\s*:\s*([^방법:결과물:]+)', step_text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+                if keyword_match:
+                    step_data['keywords'] = self.clean_text(keyword_match.group(1))
+
+                # 연구 방법 추출
+                method_patterns = [
+                    r'연구\s*방법\s*:\s*([^키워드:결과물:]+)',
+                    r'방법\s*:\s*([^키워드:결과물:]+)',
+                    r'methodology\s*:\s*([^keywords:output:]+)'
+                ]
+                for pattern in method_patterns:
+                    match = re.search(pattern, step_text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+                    if match:
+                        step_data['methodology'] = self.clean_text(match.group(1))
+                        break
+
+                # 결과물 형식 추출
+                output_patterns = [
+                    r'결과물\s*형식\s*:\s*([^참고:주의:]+)',
+                    r'결과물\s*:\s*([^참고:주의:]+)',
+                    r'output\s*format\s*:\s*([^note:reference:]+)'
+                ]
+                for pattern in output_patterns:
+                    match = re.search(pattern, step_text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+                    if match:
+                        step_data['output_format'] = self.clean_text(match.group(1))
+                        break
+
+                # 누락된 필드 재시도
+                if not step_data['methodology']:
+                    method_match = re.search(r'(?:연구\s*방법|방법론|방법)\s*:\s*([^\n]+)', 
+                                          step_text, re.IGNORECASE | re.MULTILINE)
+                    if method_match:
+                        step_data['methodology'] = self.clean_text(method_match.group(1))
+
+                # 최소한 하나의 필드가 있는 경우만 추가
+                if any(step_data.values()):
+                    steps.append(step_data)
+
+            return steps
+
+        except Exception as e:
+            app.logger.error(f"연구 계획 파싱 중 오류: {str(e)}")
+            return None
+
+    def clean_text(self, text):
+        """텍스트 정제"""
+        if not text:
+            return ''
+        
+        # 불필요한 공백 및 특수문자 제거
+        text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'["\'\[\]{}]', '', text)
+        
+        # 중복된 구분자 제거
+        text = re.sub(r'[:：\-=>\)]\s*[:：\-=>\)]', ':', text)
+        
+        # 앞뒤 특수문자 및 공백 제거
+        text = text.strip('.:：-=> \n\t')
+        
+        # 참고 및 주의사항 섹션 제거
+        patterns = [
+            r'참고\s*:[^*#\n]+',
+            r'주의\s*:[^*#\n]+',
+            r'Note\s*:[^*#\n]+',
+            r'Reference\s*:[^*#\n]+'
+        ]
+        for pattern in patterns:
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+            
+        return text.strip()
+
     def generate_research_plan(self, evaluation_plan, submission_format):
+        """연구 계획 생성 및 파싱"""
         try:
             prompt = (
                 "너는 이제부터 한국의 안보 전문 연구자가 되어 특정 연구역량 평가를 보게될거야. "
@@ -107,10 +223,22 @@ class AIService:
                 "단계 2: ..."
             )
 
-            return self._call_groq_api(prompt)
+            response = self._call_groq_api(prompt)
+            if not response:
+                return None
+
+            # AI 응답을 파싱
+            research_steps = self.parse_research_plan(response)
+            if not research_steps:
+                app.logger.error("연구 계획 파싱 실패")
+                return None
+
+            return research_steps
+
         except Exception as e:
-            app.logger.error(f"Research plan generation error: {str(e)}")
+            app.logger.error(f"연구 계획 생성 중 오류: {str(e)}")
             return None
+
 
     def search_papers(self, keywords, num_results=5):
         try:
