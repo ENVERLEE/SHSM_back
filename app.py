@@ -498,6 +498,7 @@ def process_cdn_file():
 @app.route('/api/project', methods=['POST'])
 def create_project():
     try:
+        # 1. Validate request data
         data = request.json
         required_fields = ['title', 'evaluation_plan', 'submission_format']
         
@@ -507,7 +508,19 @@ def create_project():
                 'message': 'Missing required fields'
             }), 400
 
-        # Create project
+        # 2. Generate research plan with integrated parsing
+        research_steps = ai_service.generate_research_plan(
+            data['evaluation_plan'],
+            data['submission_format']
+        )
+
+        if not research_steps:
+            return jsonify({
+                'success': False,
+                'message': 'Failed to generate research plan'
+            }), 500
+
+        # 3. Create project document
         project = {
             'title': data['title'],
             'evaluation_plan': data['evaluation_plan'],
@@ -515,107 +528,117 @@ def create_project():
             'submission_format': data['submission_format'],
             'submission_format_file': data.get('submission_format_file'),
             'created_at': datetime.utcnow(),
-            'research_steps': [],
-            'references': []
+            'research_steps': [],  # Will be populated step by step
+            'references': [],      # Will be populated with references
+            'status': 'in_progress',
+            'last_updated': datetime.utcnow()
         }
         
+        # 4. Insert initial project document
         result = db.projects.insert_one(project)
         project_id = result.inserted_id
 
-        # Generate research plan
-        research_plan = ai_service.generate_research_plan(
-            data['evaluation_plan'],
-            data['submission_format']
-        )
-
-        if not research_plan:
-            db.projects.delete_one({'_id': project_id})
-            return jsonify({
-                'success': False,
-                'message': 'Failed to generate research plan'
-            }), 500
-
-        # Parse research steps
-        research_steps = []
-        steps = research_plan.split('단계')[1:]
+        # 5. Process each research step and generate references
+        processed_steps = []
         
-        for i, step in enumerate(steps, 1):
-            step_data = {
-                'step_number': i,
-                'description': '',
-                'keywords': '',
-                'methodology': '',
-                'output_format': ''
-            }
-            
-            # Parse step content
-            lines = step.strip().split('\n')
-            current_field = None
-            
-            for line in lines:
-                line = line.strip()
-                if '설명:' in line:
-                    current_field = 'description'
-                    step_data['description'] = line.split('설명:')[1].strip()
-                elif '키워드:' in line:
-                    current_field = 'keywords'
-                    step_data['keywords'] = line.split('키워드:')[1].strip()
-                elif '방법:' in line or 'methodology:' in line:
-                    current_field = 'methodology'
-                    step_data['methodology'] = line.split(':')[1].strip()
-                elif '결과물 형식:' in line or 'output format:' in line:
-                    current_field = 'output_format'
-                    step_data['output_format'] = line.split(':')[1].strip()
-                elif current_field and line:
-                    step_data[current_field] += ' ' + line
-
-            research_steps.append(step_data)
-            
-            # Add step to project
-            db.projects.update_one(
-                {'_id': project_id},
-                {'$push': {'research_steps': step_data}}
-            )
-
-            # Generate references for step
+        for i, step in enumerate(research_steps, 1):
             try:
+                # Add step number and timestamps
+                step_data = {
+                    'step_number': i,
+                    'description': step.get('description', '').strip(),
+                    'keywords': step.get('keywords', '').strip(),
+                    'methodology': step.get('methodology', '').strip(),
+                    'output_format': step.get('output_format', '').strip(),
+                    'created_at': datetime.utcnow(),
+                    'updated_at': datetime.utcnow(),
+                    'status': 'pending',
+                    'result': None
+                }
+                
+                # Generate references for the step
                 keywords = [kw.strip() for kw in step_data['keywords'].split(',') if kw.strip()]
+                step_references = []
+                
                 if keywords:
-                    references = ai_service.search_papers(keywords)
+                    references = ai_service.search_papers(keywords, num_results=5)
                     for ref in references:
                         if not all(key in ref for key in ['title', 'content', 'url']):
                             continue
                             
-                        ref_doc = {
-                            'title': ref['title'],
+                        reference_data = {
+                            'title': ref['title'][:255],
                             'content': ref['content'],
                             'url': ref['url'],
                             'metavalue': ref.get('metavalue', {}),
-                            'created_at': datetime.utcnow()
+                            'created_at': datetime.utcnow(),
+                            'step_number': i,  # Associate reference with step
+                            'relevance_score': ref.get('relevance_score', 0)
                         }
-                        
-                        db.projects.update_one(
-                            {'_id': project_id},
-                            {'$push': {'references': ref_doc}}
-                        )
-            except Exception as e:
-                app.logger.warning(f"Reference generation error: {str(e)}")
+                        step_references.append(reference_data)
 
+                # Add references to step data
+                step_data['references'] = step_references
+                processed_steps.append(step_data)
+
+                # Update project document with each step and its references
+                db.projects.update_one(
+                    {'_id': project_id},
+                    {
+                        '$push': {
+                            'research_steps': step_data,
+                            'references': {
+                                '$each': step_references
+                            }
+                        },
+                        '$set': {
+                            'last_updated': datetime.utcnow()
+                        }
+                    }
+                )
+
+                app.logger.info(f"Processed step {i} with {len(step_references)} references")
+
+            except Exception as step_error:
+                app.logger.warning(f"Error processing step {i}: {str(step_error)}")
+                # Continue with next step instead of failing completely
+                continue
+
+        # 6. Final update to project
+        db.projects.update_one(
+            {'_id': project_id},
+            {
+                '$set': {
+                    'total_steps': len(processed_steps),
+                    'completed_steps': 0,
+                    'last_updated': datetime.utcnow()
+                }
+            }
+        )
+
+        # 7. Return success response with enhanced data
         return jsonify({
             'success': True,
             'project_id': str(project_id),
-            'research_steps': research_steps,
-            'message': 'Project created successfully'
+            'research_steps': processed_steps,
+            'total_references': sum(len(step.get('references', [])) for step in processed_steps),
+            'message': 'Project created successfully with research steps and references'
         })
 
     except Exception as e:
         app.logger.error(f"Project creation error: {str(e)}")
+        # Cleanup if project was partially created
         if 'project_id' in locals():
-            db.projects.delete_one({'_id': project_id})
+            try:
+                db.projects.delete_one({'_id': project_id})
+            except Exception as cleanup_error:
+                app.logger.error(f"Cleanup error: {str(cleanup_error)}")
+        
         return jsonify({
             'success': False,
             'message': f'Error creating project: {str(e)}'
         }), 500
+
 
 @app.route('/api/research/<project_id>', methods=['GET'])
 def get_project(project_id):
